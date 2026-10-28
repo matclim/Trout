@@ -178,6 +178,51 @@ target_link_libraries(
         spdlog::spdlog
 )
 
+# 2018 muon-flux test beam: digits reader, tracking (pattern recognition and
+# Kalman fit through the Goliath field) and output (src/detectors/muflux/)
+add_library(read_muflux_digits MODULE src/detectors/muflux/read_muflux_digits.cpp)
+target_include_directories(read_muflux_digits PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(
+    read_muflux_digits
+    PRIVATE phlex::module ROOT::RIO ROOT::ROOTNTuple spdlog::spdlog
+)
+
+add_library(
+    muflux_tracking
+    MODULE
+    src/detectors/muflux/muflux_tracking.cpp
+    include/detectors/muflux/MufluxEvent.hpp
+    include/detectors/muflux/MufluxGeometry.hpp
+    include/detectors/muflux/MufluxPatrec.hpp
+    include/detectors/muflux/MufluxKalman.hpp
+    include/acts_field_provider.hpp
+)
+target_include_directories(muflux_tracking PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(muflux_tracking PRIVATE phlex::module Acts::Core spdlog::spdlog)
+
+add_library(muflux_tracks_output MODULE src/detectors/muflux/muflux_tracks_output.cpp)
+target_include_directories(muflux_tracks_output PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(
+    muflux_tracks_output
+    PRIVATE phlex::module ROOT::RIO ROOT::ROOTNTuple spdlog::spdlog
+)
+
+# Tests of the muon-flux tracking on toy events (tests/muflux_toy.hpp)
+enable_testing()
+add_executable(muflux_patrec_test tests/muflux_patrec_test.cpp)
+target_include_directories(
+    muflux_patrec_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+)
+add_test(NAME muflux_patrec COMMAND muflux_patrec_test)
+add_executable(muflux_kalman_test tests/muflux_kalman_test.cpp)
+target_include_directories(
+    muflux_kalman_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+)
+target_link_libraries(muflux_kalman_test PRIVATE Acts::Core)
+add_test(NAME muflux_kalman COMMAND muflux_kalman_test)
+
 # Smoke-test input generator (build-only, not installed)
 add_executable(make_test_input tools/make_test_input.cpp)
 target_include_directories(
@@ -204,6 +249,9 @@ set(PLUGIN_TARGETS
     calorimeter_reco
     timing_detector_reco
     rec_output_module
+    read_muflux_digits
+    muflux_tracking
+    muflux_tracks_output
 )
 
 install(TARGETS ${PLUGIN_TARGETS} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
