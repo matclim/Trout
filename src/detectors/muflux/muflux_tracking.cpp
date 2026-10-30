@@ -18,7 +18,8 @@
 //   layer, wire_table                       required
 //   sigma           hit resolution [mm] (0.27, as in Shannon's muflux_digitise)
 //   window          beyond the tube radius when collecting hits [mm] (5)
-//   min_x_up, min_stereo, min_x_down        hits per tracklet (5, 5, 5)
+//   lr_seeds        seed with the left/right combinations of the seed hits (true)
+//   min_x_up, min_stereo, min_x_down        hits per tracklet (4, 4, 4)
 //   max_chi2_ndf    per tracklet (25)
 //   match_window    at the kick plane [mm] (30)
 //   lr_passes       refits after choosing the sides from the fit (2)
@@ -226,6 +227,7 @@ PHLEX_REGISTER_ALGORITHMS(m, config) {
     mf::PatrecConfig patrec;
     patrec.sigma = config.get<double>("sigma", double{patrec.sigma});
     patrec.window = config.get<double>("window", double{patrec.window});
+    patrec.lr_seeds = config.get<bool>("lr_seeds", bool{patrec.lr_seeds});
     patrec.min_x_up = config.get<int>("min_x_up", int{patrec.min_x_up});
     patrec.min_stereo = config.get<int>("min_stereo", int{patrec.min_stereo});
     patrec.min_x_down = config.get<int>("min_x_down", int{patrec.min_x_down});

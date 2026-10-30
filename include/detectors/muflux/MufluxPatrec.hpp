@@ -19,6 +19,14 @@
 // from the wire positions, each pass takes the sign closest to the current
 // line and refits, until no sign changes.
 //
+// Seeds: a tracklet is seeded by a pair of hits in two stations. With
+// lr_seeds (default), each of the four left/right combinations of the pair
+// gives a line through the two track crossings, so the line predicts the
+// other layers to within the resolution; the hit of a layer is then the one
+// whose drift distance best fits the predicted distance to its wire. Without
+// it, the line joins the two wires and the hit is the one whose wire is
+// closest to the line, which can be off by up to a tube radius per seed hit.
+//
 // The resulting candidates (hits, signs, tracklet parameters, charge and
 // momentum) seed the Kalman fit (MufluxKalman.hpp). Kept free of ACTS and
 // phlex so that it can be tested on its own.
@@ -37,6 +45,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -62,9 +71,10 @@ struct Assigned {
 struct PatrecConfig {
     double sigma = 0.27;       ///< hit resolution used in the fits [mm]
     double window = 5.0;       ///< beyond the tube radius when collecting hits [mm]
-    int min_x_up = 5;          ///< hits in the x layers of T1 and T2
-    int min_stereo = 5;        ///< hits in the u and v layers
-    int min_x_down = 5;        ///< hits in the layers of T3 and T4
+    bool lr_seeds = true;      ///< seed with the left/right combinations of the seed hits
+    int min_x_up = 4;          ///< hits in the x layers of T1 and T2
+    int min_stereo = 4;        ///< hits in the u and v layers
+    int min_x_down = 3;        ///< hits in the layers of T3 and T4 (the match constrains them)
     double max_chi2_ndf = 25;  ///< per tracklet
     double max_slope = 0.3;    ///< |tx|, |ty|
     double match_window = 30;  ///< |x difference| of the two tracklets at kick_z [mm]
@@ -338,30 +348,46 @@ class Patrec {
         return fit;
     }
 
-    /// The hit of `layer` closest to `pred` within the tube radius plus the
-    /// window, or none.
+    /// The hit of `layer` for a track predicted at `pred` (coordinate along
+    /// meas_dir) with slope `tm` across the wires, among those whose wire lies
+    /// within the tube radius plus the window: with lr_seeds the one whose
+    /// drift distance best fits the predicted distance to its wire, otherwise
+    /// the one with the closest wire; none if no wire is close enough.
     std::optional<std::size_t> closest(std::vector<Hit> const& hits,
                                        std::map<int, std::vector<std::size_t>> const& by_layer,
-                                       std::vector<bool> const& used, int layer,
-                                       double pred) const {
+                                       std::vector<bool> const& used, int layer, double pred,
+                                       double tm = 0) const {
         auto const it = by_layer.find(layer);
         if (it == by_layer.end()) {
             return std::nullopt;
         }
         double const cut = geometry_.layers()[layer].radius + config_.window;
+        double const stretch = std::sqrt(1 + tm * tm);
         std::optional<std::size_t> best;
-        double best_d = cut;
+        double best_d = std::numeric_limits<double>::max();
         for (auto const i : it->second) {
             if (used[i]) {
                 continue;
             }
-            double const d = std::abs(hits[i].wire - pred);
+            double const dw = std::abs(hits[i].wire - pred);
+            if (dw >= cut) {
+                continue;
+            }
+            double const d = config_.lr_seeds ? std::abs(dw - hits[i].drift * stretch) : dw;
             if (d < best_d) {
                 best_d = d;
                 best = i;
             }
         }
         return best;
+    }
+
+    /// The seed sides to try: the four left/right combinations, or the wires.
+    std::vector<std::pair<int, int>> seed_signs() const {
+        if (config_.lr_seeds) {
+            return {{+1, +1}, {+1, -1}, {-1, +1}, {-1, -1}};
+        }
+        return {{0, 0}};
     }
 
     /// Straight x-z tracklets in the x layers `group`, seeded by pairs of hits
@@ -389,42 +415,52 @@ class Patrec {
         auto const slope_of = [](Hit const&, std::array<double, 4> const& p) { return p[1]; };
 
         std::vector<XTracklet> found;
+        std::set<std::vector<std::size_t>> tried;  // hit sets already fitted
         for (auto const ia : seeds_a) {
             for (auto const ib : seeds_b) {
-                auto const& ha = hits[ia];
-                auto const& hb = hits[ib];
-                double const za = ha.z, zb = hb.z;
-                if (za == zb) {
-                    continue;
-                }
-                double const tx = (hb.wire - ha.wire) / (zb - za);
-                if (std::abs(tx) > config_.max_slope) {
-                    continue;
-                }
-                std::vector<std::size_t> sel;
-                for (auto const l : group) {
-                    double const pred = ha.wire + tx * (layers[l].z - za);
-                    if (auto const i = closest(hits, by_layer, used, l, pred)) {
-                        sel.push_back(*i);
+                for (auto const& [sa, sb] : seed_signs()) {
+                    auto const& ha = hits[ia];
+                    auto const& hb = hits[ib];
+                    double const za = ha.z, zb = hb.z;
+                    if (za == zb) {
+                        continue;
                     }
+                    // the crossings of the seed hits (x layers: meas_dir is x, the
+                    // slope stretch is left to the fit)
+                    double const xa = ha.wire + sa * ha.drift;
+                    double const xb = hb.wire + sb * hb.drift;
+                    double const tx = (xb - xa) / (zb - za);
+                    if (std::abs(tx) > config_.max_slope) {
+                        continue;
+                    }
+                    std::vector<std::size_t> sel;
+                    for (auto const l : group) {
+                        double const pred = xa + tx * (layers[l].z - za);
+                        if (auto const i = closest(hits, by_layer, used, l, pred, tx)) {
+                            sel.push_back(*i);
+                        }
+                    }
+                    if (std::ranges::find(sel, ia) == sel.end() ||
+                        std::ranges::find(sel, ib) == sel.end() ||
+                        static_cast<int>(sel.size()) < min_hits) {
+                        continue;
+                    }
+                    if (!tried.insert(sel).second) {
+                        continue;
+                    }
+                    auto const fit = fit_lr(hits, sel, 2, row_of, slope_of, min_hits);
+                    if (!fit.ok || std::abs(fit.params[1]) > config_.max_slope) {
+                        continue;
+                    }
+                    XTracklet t{.params = {fit.params[0], fit.params[1]},
+                                .hits = {},
+                                .chi2 = fit.chi2,
+                                .ndf = fit.ndf};
+                    for (std::size_t k = 0; k < sel.size(); ++k) {
+                        t.hits.push_back({sel[k], fit.signs[k]});
+                    }
+                    found.push_back(std::move(t));
                 }
-                if (std::ranges::find(sel, ia) == sel.end() ||
-                    std::ranges::find(sel, ib) == sel.end() ||
-                    static_cast<int>(sel.size()) < min_hits) {
-                    continue;
-                }
-                auto const fit = fit_lr(hits, sel, 2, row_of, slope_of, min_hits);
-                if (!fit.ok || std::abs(fit.params[1]) > config_.max_slope) {
-                    continue;
-                }
-                XTracklet t{.params = {fit.params[0], fit.params[1]},
-                            .hits = {},
-                            .chi2 = fit.chi2,
-                            .ndf = fit.ndf};
-                for (std::size_t k = 0; k < sel.size(); ++k) {
-                    t.hits.push_back({sel[k], fit.signs[k]});
-                }
-                found.push_back(std::move(t));
             }
         }
         // best first: most hits, then lowest chi2; each hit used once
@@ -454,10 +490,10 @@ class Patrec {
                     std::vector<bool>& used, XTracklet const& xt, Candidate& c) const {
         auto const& layers = geometry_.layers();
         auto const x_at = [&](double z) { return xt.params[0] + xt.params[1] * (z - z_ref_up_); };
-        // y of a stereo hit's wire at the tracklet's x
-        auto const y_of = [&](Hit const& h) {
+        // y of a stereo hit at the tracklet's x, for a side of its wire (0: the wire)
+        auto const y_of = [&](Hit const& h, int sign) {
             auto const& l = layers[h.layer];
-            return (h.wire - l.meas_dir[0] * x_at(h.z)) / l.meas_dir[1];
+            return (h.wire + sign * h.drift - l.meas_dir[0] * x_at(h.z)) / l.meas_dir[1];
         };
         std::vector<std::size_t> st1, st2;
         for (auto const l : stereo_up_) {
@@ -484,33 +520,39 @@ class Patrec {
         };
         detail::Fit best;
         std::vector<std::size_t> best_sel;
+        std::set<std::vector<std::size_t>> tried;  // hit sets already fitted
         for (auto const ia : st1) {
             for (auto const ib : st2) {
-                double const za = hits[ia].z, zb = hits[ib].z;
-                double const ya = y_of(hits[ia]), yb = y_of(hits[ib]);
-                double const ty = (yb - ya) / (zb - za);
-                if (std::abs(ty) > config_.max_slope) {
-                    continue;
-                }
-                std::vector<std::size_t> sel;
-                for (auto const l : stereo_up_) {
-                    double const z = layers[l].z;
-                    double const pred = layers[l].coord(x_at(z), ya + ty * (z - za));
-                    if (auto const i = closest(hits, by_layer, used, l, pred)) {
-                        sel.push_back(*i);
+                for (auto const& [sa, sb] : seed_signs()) {
+                    double const za = hits[ia].z, zb = hits[ib].z;
+                    double const ya = y_of(hits[ia], sa), yb = y_of(hits[ib], sb);
+                    double const ty = (yb - ya) / (zb - za);
+                    if (std::abs(ty) > config_.max_slope) {
+                        continue;
                     }
-                }
-                if (static_cast<int>(sel.size()) < config_.min_stereo) {
-                    continue;
-                }
-                auto const fit = fit_lr(hits, sel, 2, row_y, slope_y, config_.min_stereo);
-                if (!fit.ok || std::abs(fit.params[1]) > config_.max_slope) {
-                    continue;
-                }
-                if (!best.ok || sel.size() > best_sel.size() ||
-                    (sel.size() == best_sel.size() && fit.chi2 < best.chi2)) {
-                    best = fit;
-                    best_sel = sel;
+                    std::vector<std::size_t> sel;
+                    for (auto const l : stereo_up_) {
+                        double const z = layers[l].z;
+                        double const pred = layers[l].coord(x_at(z), ya + ty * (z - za));
+                        double const tm =
+                            layers[l].meas_dir[0] * xt.params[1] + layers[l].meas_dir[1] * ty;
+                        if (auto const i = closest(hits, by_layer, used, l, pred, tm)) {
+                            sel.push_back(*i);
+                        }
+                    }
+                    if (static_cast<int>(sel.size()) < config_.min_stereo ||
+                        !tried.insert(sel).second) {
+                        continue;
+                    }
+                    auto const fit = fit_lr(hits, sel, 2, row_y, slope_y, config_.min_stereo);
+                    if (!fit.ok || std::abs(fit.params[1]) > config_.max_slope) {
+                        continue;
+                    }
+                    if (!best.ok || sel.size() > best_sel.size() ||
+                        (sel.size() == best_sel.size() && fit.chi2 < best.chi2)) {
+                        best = fit;
+                        best_sel = sel;
+                    }
                 }
             }
         }
