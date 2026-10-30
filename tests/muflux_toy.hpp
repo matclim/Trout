@@ -9,7 +9,10 @@
 // measured Goliath map read from its text file (x y z Bx By Bz in mm and T, as
 // FairShip's field/GoliathFieldMap.txt), and digitised as in Shannon's
 // muflux_digitise (|Gauss(DOCA, 0.27 mm)|), with 3% inefficiency, noise hits
-// and one digit per tube. The layout follows the 2018 one (T1 x-u, T2 v-x, T3
+// and one digit per tube. At every layer the muon scatters (Highland's
+// formula) and loses energy (mean dE/dx of a muon in aluminium) in the
+// layer's mean tube-wall thickness, the material model of MufluxKalman.hpp;
+// `wall` = 0 turns this off. The layout follows the 2018 one (T1 x-u, T2 v-x, T3
 // and T4 x; 60 degree stereo), with invented T3/T4 tube positions.
 
 #pragma once
@@ -230,8 +233,9 @@ inline std::pair<double, double> kick_of(Field const& field) {
 
 class Generator {
    public:
-    Generator(mf::Geometry const& geo, Field field, std::uint64_t seed, double two_muon = 0.2)
-        : geo_{geo}, field_{std::move(field)}, rng_{seed}, two_muon_{two_muon} {}
+    Generator(mf::Geometry const& geo, Field field, std::uint64_t seed, double two_muon = 0.2,
+              double wall = 0.85)
+        : geo_{geo}, field_{std::move(field)}, rng_{seed}, two_muon_{two_muon}, wall_{wall} {}
 
     Event next() {
         Event ev;
@@ -244,13 +248,15 @@ class Generator {
             State s{-80 + 160 * u01_(rng_), -80 + 160 * u01_(rng_), -0.03 + 0.06 * u01_(rng_),
                     -0.03 + 0.06 * u01_(rng_)};
             double z = 0;
+            double p = mu.p;  // falls with the energy loss
             for (int li = 0; li < static_cast<int>(geo_.layers().size()); ++li) {
                 auto const& l = geo_.layers()[li];
-                s = propagate(s, z, l.z, mu.q / mu.p, field_);
+                s = propagate(s, z, l.z, mu.q / p, field_);
                 z = l.z;
                 if (li == 0) {
                     mu.first = s;
                 }
+                scatter(s, p, mf::mean_wall_thickness(l, wall_));
                 double const c0 = l.coord(s.x, s.y);
                 auto const it = std::ranges::min_element(
                     l.tubes, {}, [&](mf::Tube const& t) { return std::abs(t.coord - c0); });
@@ -308,10 +314,28 @@ class Generator {
     }
 
    private:
+    // Multiple scattering (Highland) and mean energy loss of a muon crossing
+    // `t` mm of aluminium along z, applied at the layer.
+    void scatter(State& s, double& p, double t) {
+        if (!(t > 0)) {
+            return;
+        }
+        constexpr double x0 = 88.97;      // mm
+        constexpr double dedx = 0.48e-3;  // GeV/mm, mean for 5-300 GeV muons in aluminium
+        double const n = std::sqrt(1 + s.tx * s.tx + s.ty * s.ty);
+        double const x = t * n / x0;
+        double const theta0 = 0.0136 / p * std::sqrt(x) * (1 + 0.038 * std::log(x));
+        // projected angles theta_x, theta_y: d tx = (1 + tx^2) theta_x
+        s.tx += (1 + s.tx * s.tx) * theta0 * gauss_(rng_);
+        s.ty += (1 + s.ty * s.ty) * theta0 * gauss_(rng_);
+        p -= dedx * t * n;
+    }
+
     mf::Geometry const& geo_;
     Field field_;
     std::mt19937_64 rng_;
     double two_muon_;
+    double wall_;
     std::uniform_real_distribution<double> u01_{0, 1};
     std::normal_distribution<double> gauss_{0, 1};
     std::poisson_distribution<int> noise_{2.0};

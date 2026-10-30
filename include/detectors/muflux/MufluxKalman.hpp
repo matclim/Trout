@@ -15,9 +15,18 @@
 // the track without that hit (the unbiased smoothed state; the smoothed state
 // for an outlier) and the track refitted while sides change (lr_passes).
 //
-// No material is modelled (no multiple scattering or energy loss): the gas,
-// tube walls and air between T1 and T4 are a small fraction of a radiation
-// length.
+// Material (option `material`, on by default): multiple scattering and energy
+// loss in the aluminium tube walls. Each layer carries, on its tube surfaces
+// and on one plane of its own, the wall thickness averaged over the layer
+// (mean_wall_thickness in MufluxGeometry.hpp: 2.4 mm of aluminium, 2.7% of a
+// radiation length, for 0.85 mm walls at 42 mm pitch). The wall density is an
+// option (tube_wall_density, default that of aluminium): the geometry of the
+// legacy simulation, and so a simulation built from it, gives the walls
+// 0.9 g/cm3 ("CoilAluminium"), a third of a real tube's. A track meets the
+// material of every layer it crosses between its first and last hit: the tube
+// surface of its hit in that layer, or the layer's plane if it has none. The
+// gas (Ar/CO2) and the air are left out (< 0.1% of a radiation length per
+// layer, about 2% for the air between T1 and T4).
 
 #pragma once
 
@@ -36,6 +45,9 @@
 #include <Acts/Geometry/GeometryContext.hpp>
 #include <Acts/MagneticField/MagneticFieldContext.hpp>
 #include <Acts/MagneticField/MagneticFieldProvider.hpp>
+#include <Acts/Material/HomogeneousSurfaceMaterial.hpp>
+#include <Acts/Material/Material.hpp>
+#include <Acts/Material/MaterialSlab.hpp>
 #include <Acts/Propagator/DirectNavigator.hpp>
 #include <Acts/Propagator/EigenStepper.hpp>
 #include <Acts/Propagator/Propagator.hpp>
@@ -102,6 +114,9 @@ class KalmanFit {
         double sigma_theta = 0.005;  ///< rad
         double sigma_qop_rel = 0.3;  ///< of q/p
         double outlier_chi2 = 16;    ///< predicted chi2 above which a hit is an outlier
+        bool material = true;        ///< multiple scattering and energy loss in the tube walls
+        double tube_wall = 0.85;     ///< aluminium wall of the drift tubes [mm]
+        double tube_wall_density = 2.699;  ///< of the walls [g/cm3]; 0.9 in the legacy geometry
     };
 
     KalmanFit(Geometry const& geometry, std::shared_ptr<const Acts::MagneticFieldProvider> field,
@@ -109,8 +124,18 @@ class KalmanFit {
         : geometry_{geometry},
           config_{config},
           gctx_{Acts::GeometryContext::dangerouslyDefaultConstruct()} {
+        // aluminium (PDG): X0 24.01 g/cm2, nuclear interaction length 107.2 g/cm2,
+        // at the configured density
+        using Acts::UnitConstants::cm;
+        using Acts::UnitConstants::cm3;
+        using Acts::UnitConstants::g;
+        double const rho = config_.tube_wall_density;
+        auto const aluminium = Acts::Material::fromMassDensity(
+            static_cast<float>(24.01 / rho * cm), static_cast<float>(107.2 / rho * cm), 26.98f,
+            13.f, static_cast<float>(rho * g / cm3));
         // one plane per tube, at its z, with the local axes of its layer; the
-        // tubes of a layer share the origin of loc0 (the layer centre)
+        // tubes of a layer share the origin of loc0 (the layer centre); and one
+        // plane per layer, at its z, for the material of the layers without a hit
         for (auto const& l : geometry_.layers()) {
             Acts::RotationMatrix3 rot;
             rot.col(0) = Acts::Vector3(l.meas_dir[0], l.meas_dir[1], 0);
@@ -118,12 +143,33 @@ class KalmanFit {
             rot.col(2) = Acts::Vector3(0, 0, 1);
             auto bounds =
                 std::make_shared<Acts::RectangleBounds>(l.half_width + 10., l.half_length + 10.);
+            std::shared_ptr<const Acts::ISurfaceMaterial> material;
+            if (config_.material) {
+                double const t = mean_wall_thickness(l, config_.tube_wall);
+                material = std::make_shared<const Acts::HomogeneousSurfaceMaterial>(
+                    Acts::MaterialSlab(aluminium, static_cast<float>(t * Acts::UnitConstants::mm)));
+            }
             for (auto const& t : l.tubes) {
                 Acts::Transform3 trf = Acts::Transform3::Identity();
                 trf.translate(Acts::Vector3(l.centre[0], l.centre[1], t.z));
                 trf.rotate(rot);
-                surfaces_.emplace(t.id, Acts::Surface::makeShared<Acts::PlaneSurface>(trf, bounds));
+                auto surface = Acts::Surface::makeShared<Acts::PlaneSurface>(trf, bounds);
+                if (material) {
+                    surface->assignSurfaceMaterial(material);
+                }
+                surfaces_.emplace(t.id, std::move(surface));
             }
+            Acts::Transform3 trf = Acts::Transform3::Identity();
+            trf.translate(Acts::Vector3(l.centre[0], l.centre[1], l.z));
+            trf.rotate(rot);
+            // wider than the tubes: a track may cross the layer plane beside them
+            auto plane = Acts::Surface::makeShared<Acts::PlaneSurface>(
+                trf,
+                std::make_shared<Acts::RectangleBounds>(l.half_width + 500., l.half_length + 500.));
+            if (material) {
+                plane->assignSurfaceMaterial(material);
+            }
+            layer_surfaces_.push_back(std::move(plane));
         }
         Stepper stepper(std::move(field));
         Acts::DirectNavigator navigator{
@@ -240,6 +286,7 @@ class KalmanFit {
 
         // measurements, ordered by z (one per layer)
         Measurements meas;
+        std::map<int, Acts::Surface const*> measured_layer;  // layer -> its hit's surface
         for (std::size_t k = 0; k < cand.hits.size(); ++k) {
             auto const& a = cand.hits[k];
             auto const& h = hits[a.hit];
@@ -252,16 +299,26 @@ class KalmanFit {
                                  .loc0 = coord - centre,
                                  .variance = config_.sigma * config_.sigma,
                                  .cand_hit = k});
+            measured_layer[h.layer] = surfaces_.at(h.tube).get();
         }
         std::ranges::sort(meas.list, {}, [](Measurement const& m) {
             return m.surface->center(Acts::GeometryContext::dangerouslyDefaultConstruct()).z();
         });
         std::vector<Acts::SourceLink> source_links;
-        std::vector<Acts::Surface const*> sequence;
         for (std::size_t i = 0; i < meas.list.size(); ++i) {
             source_links.emplace_back(MufluxSourceLink{i});
-            if (sequence.empty() || sequence.back() != meas.list[i].surface) {
-                sequence.push_back(meas.list[i].surface);
+        }
+        // the surfaces in z order, from the first measured layer to the last:
+        // the hit's tube surface where the layer has one, else (with material)
+        // the layer's plane
+        std::vector<Acts::Surface const*> sequence;
+        int const first_layer = measured_layer.begin()->first;
+        int const last_layer = measured_layer.rbegin()->first;
+        for (int li = first_layer; li <= last_layer; ++li) {
+            if (auto const it = measured_layer.find(li); it != measured_layer.end()) {
+                sequence.push_back(it->second);
+            } else if (config_.material) {
+                sequence.push_back(layer_surfaces_[li].get());
             }
         }
 
@@ -316,8 +373,8 @@ class KalmanFit {
         prop.pathLimit = 20 * Acts::UnitConstants::m;
         Acts::KalmanFitterOptions<Trajectory> options(gctx_, mctx, std::cref(cctx), ext, prop,
                                                       &first);
-        options.multipleScattering = false;
-        options.energyLoss = false;
+        options.multipleScattering = config_.material;
+        options.energyLoss = config_.material;
         options.referenceSurfaceStrategy = Acts::TrackExtrapolationStrategy::first;
 
         Acts::TrackContainer tracks(Acts::VectorTrackContainer{}, Trajectory{});
@@ -390,6 +447,7 @@ class KalmanFit {
     Config config_;
     Acts::GeometryContext gctx_;
     std::map<std::int32_t, std::shared_ptr<Acts::PlaneSurface>> surfaces_;  // per tube
+    std::vector<std::shared_ptr<Acts::PlaneSurface>> layer_surfaces_;       // per layer
     std::unique_ptr<Fitter> fitter_;
 };
 

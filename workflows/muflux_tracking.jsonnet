@@ -15,8 +15,10 @@
 //   map         map name inside field_map (default 'goliath_2018')
 //   out         output file (default 'muflux_tracks.root')
 //   sigma       hit resolution in mm (default 0.27)
+//   tube_wall_density  of the drift-tube walls in g/cm3 (default 2.699, aluminium; 0.9 for
+//               simulations from the legacy geometry, whose walls are "CoilAluminium")
 function(infile, events, wire_table, field_map, map='goliath_2018', out='muflux_tracks.root',
-         sigma=0.27)
+         sigma=0.27, tube_wall_density=2.699)
   {
     stage: 'reconstruction',
     driver: {
@@ -44,6 +46,7 @@ function(infile, events, wire_table, field_map, map='goliath_2018', out='muflux_
         layer: 'event',
         wire_table: wire_table,
         sigma: sigma,
+        tube_wall_density: tube_wall_density,
       },
       output: {
         cpp: 'muflux_tracks_output',

@@ -34,6 +34,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <numbers>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -115,11 +116,24 @@ struct Layer {
     double half_width = 0;    ///< half extent along meas_dir, tube walls included [mm]
     double half_length = 0;   ///< half extent along wire_dir [mm]
     double radius = 0;        ///< gas radius of its tubes [mm]
+    double pitch = 0;         ///< usual distance between neighbouring wires [mm]
     std::vector<Tube> tubes;  ///< ordered by coord
 
     /// Coordinate measured by this layer for a point (x, y).
     double coord(double x, double y) const { return meas_dir[0] * x + meas_dir[1] * y; }
 };
+
+/// Thickness along z of tube walls of thickness `wall` around the gas radius,
+/// averaged over a layer: the wall's cross-section area per pitch [mm]. A track
+/// crossing a layer meets on average this much wall material (two walls of a
+/// tube, or none in the gap between tubes).
+inline double mean_wall_thickness(Layer const& l, double wall) {
+    if (!(l.pitch > 0)) {
+        return 0;
+    }
+    double const ro = l.radius + wall;
+    return std::numbers::pi * (ro * ro - l.radius * l.radius) / l.pitch;
+}
 
 /// The drift-tube layers, ordered by z.
 class Geometry {
@@ -202,6 +216,15 @@ class Geometry {
                 l.half_length = std::max(l.half_length, std::abs(t.along - ca) + t.half_length);
             }
             std::ranges::sort(l.tubes, {}, &Tube::coord);
+            // the median spacing: module gaps (T3, T4) are rarer than the pitch
+            std::vector<double> gaps;
+            for (std::size_t k = 1; k < l.tubes.size(); ++k) {
+                gaps.push_back(l.tubes[k].coord - l.tubes[k - 1].coord);
+            }
+            if (!gaps.empty()) {
+                std::ranges::nth_element(gaps, gaps.begin() + gaps.size() / 2);
+                l.pitch = gaps[gaps.size() / 2];
+            }
             layers_.push_back(std::move(l));
         }
         std::ranges::stable_sort(layers_, {}, &Layer::z);

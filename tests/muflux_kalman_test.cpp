@@ -153,6 +153,37 @@ int main(int argc, char** argv) {
     check((Quantiles::tail(dp_lo, 0.3) + Quantiles::tail(dp_hi, 0.3)) < 0.01 * n_ok,
           "momentum tails < 1%");
 
+    // the same muons fitted without the material: the pulls show the multiple
+    // scattering the fit then ignores
+    {
+        mf::KalmanFit::Config no_material;
+        no_material.material = false;
+        mf::KalmanFit const kf0{geo, std::make_shared<ToyField>(field), no_material};
+        Generator gen0{geo, field, 20180702, 0.0};
+        std::vector<double> pull0, dp0;
+        for (int ev_n = 0; ev_n < 1000; ++ev_n) {
+            auto const ev = gen0.next();
+            auto cands = patrec.find(ev.hits);
+            int const best = best_candidate(ev, cands, 0);
+            if (best < 0) {
+                continue;
+            }
+            auto const fit = kf0.fit(ev.hits, cands[best], patrec);
+            if (fit.ok) {
+                pull0.push_back((fit.p - ev.muons[0].p) / fit.sigma_p);
+                if (ev.muons[0].p < 50) {
+                    dp0.push_back(fit.p / ev.muons[0].p - 1);
+                }
+            }
+        }
+        auto const q0 = Quantiles{pull0}, d0 = Quantiles{dp0};
+        std::printf(
+            "  without material in the fit: p pull median %.3f width %.3f; p_fit/p_true - 1 "
+            "(< 50 GeV) median %.4f width %.4f\n",
+            q0.median, q0.width, d0.median, d0.width);
+        check(q0.width > pl.width, "the material model narrows the pulls");
+    }
+
     if (failures == 0) {
         std::puts("muflux_kalman: all checks passed");
     }

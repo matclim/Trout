@@ -19,10 +19,13 @@
 //   sigma           hit resolution [mm] (0.27, as in Shannon's muflux_digitise)
 //   window          beyond the tube radius when collecting hits [mm] (5)
 //   lr_seeds        seed with the left/right combinations of the seed hits (true)
-//   min_x_up, min_stereo, min_x_down        hits per tracklet (4, 4, 4)
+//   min_x_up, min_stereo, min_x_down        hits per tracklet (4, 4, 3)
 //   max_chi2_ndf    per tracklet (25)
 //   match_window    at the kick plane [mm] (30)
 //   lr_passes       refits after choosing the sides from the fit (2)
+//   material        multiple scattering and energy loss in the tube walls (true)
+//   tube_wall       aluminium wall of the drift tubes [mm] (0.85)
+//   tube_wall_density  of the walls [g/cm3] (2.699; 0.9 in the legacy geometry)
 
 #include "acts_field_provider.hpp"
 #include "detectors/muflux/MufluxEvent.hpp"
@@ -57,6 +60,11 @@ class Tracker {
           kalman_config_{kalman} {
         spdlog::info("muflux_tracking: {} drift-tube layers from '{}'", geometry_.layers().size(),
                      wire_table);
+        spdlog::info(
+            "muflux_tracking: pattern recognition: min hits {}/{}/{}, window {} mm, lr_seeds {}; "
+            "fit: sigma {} mm, material {} (tube wall {} mm, {} g/cm3)",
+            patrec.min_x_up, patrec.min_stereo, patrec.min_x_down, patrec.window, patrec.lr_seeds,
+            kalman.sigma, kalman.material, kalman.tube_wall, kalman.tube_wall_density);
     }
 
     ~Tracker() {
@@ -236,6 +244,10 @@ PHLEX_REGISTER_ALGORITHMS(m, config) {
     mf::KalmanFit::Config kalman;
     kalman.sigma = patrec.sigma;
     kalman.lr_passes = config.get<int>("lr_passes", int{kalman.lr_passes});
+    kalman.material = config.get<bool>("material", bool{kalman.material});
+    kalman.tube_wall = config.get<double>("tube_wall", double{kalman.tube_wall});
+    kalman.tube_wall_density =
+        config.get<double>("tube_wall_density", double{kalman.tube_wall_density});
 
     auto tracker = std::make_shared<Tracker>(config.get<std::string>("wire_table"), patrec, kalman);
 
