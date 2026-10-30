@@ -10,10 +10,19 @@
 // tube is a plane surface at its z with the local axes (meas_dir, wire_dir) of
 // its layer, and each hit a 1D measurement of loc0, the coordinate across the
 // wires: wire +- drift * sqrt(1 + t_m^2) relative to the layer centre (see
-// MufluxPatrec.hpp). In the refits, hits whose predicted chi2 exceeds
-// outlier_chi2 are left out of the filter. After a fit, the side of every hit is chosen again from
-// the track without that hit (the unbiased smoothed state; the smoothed state
-// for an outlier) and the track refitted while sides change (lr_passes).
+// MufluxPatrec.hpp). Outliers: after each fit, the hit with the largest
+// unbiased residual (measured loc0 minus the smoothed track without that hit,
+// over its expected spread) is left out if its square exceeds outlier_chi2,
+// and the track refitted, one hit at a time (max_outliers), keeping at least 3
+// hits in each group (x layers of T1/T2, u/v layers, T3/T4). A hit left out
+// stays on the track's path as a material surface, so its residual is still
+// known; it comes back when, with its better side, it fits again. The side of
+// every hit is chosen again from the track without that hit and the track
+// refitted while sides change (lr_passes). Removing the worst hit after the
+// fit, rather than rejecting hits on their predicted chi2 during the filter,
+// keeps one wrong early hit from turning good later hits into outliers. While
+// the track's chi2/ndf exceeds bad_track_chi2_ndf, the worst hit is left out
+// already beyond 2 sigma.
 //
 // Material (option `material`, on by default): multiple scattering and energy
 // loss in the aluminium tube walls. Each layer carries, on its tube surfaces
@@ -92,7 +101,7 @@ struct FitOutput {
     double chi2 = 0;
     int ndf = 0;
     int n_meas = 0;
-    int n_outliers = 0;  ///< hits left out of the fit by the outlier cut
+    int n_outliers = 0;  ///< hits left out of the fit as outliers
     int charge = 0;
     double p = 0;        ///< GeV, at the first measurement
     double sigma_p = 0;  ///< GeV
@@ -107,15 +116,17 @@ struct FitOutput {
 class KalmanFit {
    public:
     struct Config {
-        double sigma = 0.27;         ///< hit resolution [mm]
-        int lr_passes = 2;           ///< refits after choosing the sides from the fit (>= 1)
-        double sigma_loc0 = 2.0;     ///< start covariance [mm]
-        double sigma_loc1 = 20.0;    ///< along the wires [mm]
-        double sigma_theta = 0.005;  ///< rad
-        double sigma_qop_rel = 0.3;  ///< of q/p
-        double outlier_chi2 = 16;    ///< predicted chi2 above which a hit is an outlier
-        bool material = true;        ///< multiple scattering and energy loss in the tube walls
-        double tube_wall = 0.85;     ///< aluminium wall of the drift tubes [mm]
+        double sigma = 0.27;            ///< hit resolution [mm]
+        int lr_passes = 2;              ///< refits after choosing the sides from the fit (>= 1)
+        double sigma_loc0 = 2.0;        ///< start covariance [mm]
+        double sigma_loc1 = 20.0;       ///< along the wires [mm]
+        double sigma_theta = 0.005;     ///< rad
+        double sigma_qop_rel = 0.3;     ///< of q/p
+        double outlier_chi2 = 16;       ///< unbiased residual chi2 above which a hit is left out
+        int max_outliers = 5;           ///< hits left out at most
+        double bad_track_chi2_ndf = 3;  ///< above it, hits beyond 2 sigma are left out too
+        bool material = true;           ///< multiple scattering and energy loss in the tube walls
+        double tube_wall = 0.85;        ///< aluminium wall of the drift tubes [mm]
         double tube_wall_density = 2.699;  ///< of the walls [g/cm3]; 0.9 in the legacy geometry
     };
 
@@ -198,31 +209,76 @@ class KalmanFit {
             bool const behind = geometry_.layers()[h.layer].station >= 3;
             pred[k] = {cand.position(h.z, behind), cand.slopes(behind)};
         }
-        for (int pass = 0; pass <= config_.lr_passes; ++pass) {
-            // the first fit uses every hit: a poor starting momentum can make good
-            // hits look like outliers; the refits apply the outlier cut
-            auto result = fit_once(hits, cand, pred, pass > 0);
+        std::vector<bool> excluded(cand.hits.size(), false);
+        auto const group_of = [&](std::size_t k) {
+            auto const& l = geometry_.layers()[hits[cand.hits[k].hit].layer];
+            return l.station >= 3 ? 2 : l.stereo ? 1 : 0;
+        };
+        int lr_pass = 0;
+        int const max_fits = config_.lr_passes + 2 * config_.max_outliers + 1;
+        for (int n_fits = 0; n_fits < max_fits; ++n_fits) {
+            auto result = fit_once(hits, cand, pred, excluded);
             if (!result.output.ok) {
-                return pass == 0 ? result.output : out;
+                if (n_fits == 0) {
+                    return result.output;
+                }
+                break;  // keep the last good fit
             }
             out = std::move(result.output);
-            if (pass == config_.lr_passes) {
-                break;
-            }
-            // choose the sides again from the smoothed states
             for (std::size_t k = 0; k < cand.hits.size(); ++k) {
                 if (result.smoothed[k]) {
                     pred[k] = *result.smoothed[k];
                 }
             }
+            // 1. leave out the worst hit, if it is an outlier and its group keeps 3 hits
+            std::array<int, 3> in_group{0, 0, 0};
+            for (std::size_t k = 0; k < cand.hits.size(); ++k) {
+                in_group[group_of(k)] += excluded[k] ? 0 : 1;
+            }
+            // the cut: outlier_chi2, or, while the track as a whole is poor
+            // (chi2/ndf above bad_track_chi2_ndf), any hit beyond 2 sigma: a wrong
+            // hit can spread its residual over the others, at low momentum where
+            // the scattering lets the track bend towards it
+            bool const poor =
+                out.ndf > 0 && out.chi2 > config_.bad_track_chi2_ndf * static_cast<double>(out.ndf);
+            int worst = -1;
+            double worst_chi2 = poor ? 4.0 : config_.outlier_chi2;
+            int n_excluded = 0;
+            for (std::size_t k = 0; k < cand.hits.size(); ++k) {
+                n_excluded += excluded[k] ? 1 : 0;
+                double const c = result.chi2_hit[k];
+                if (!excluded[k] && !std::isnan(c) && c > worst_chi2 && in_group[group_of(k)] > 3) {
+                    worst_chi2 = c;
+                    worst = static_cast<int>(k);
+                }
+            }
+            if (worst >= 0 && n_excluded < config_.max_outliers) {
+                excluded[worst] = true;
+                continue;
+            }
+            // 2. choose the sides again from the track without each hit, and
+            //    take back the hits left out that fit with their better side
+            if (lr_pass >= config_.lr_passes) {
+                break;
+            }
+            ++lr_pass;
             std::size_t idx = 0;
             int const changed =
                 patrec.reassign_signs(hits, cand, [&](Assigned const&) { return pred[idx++]; });
             out.lr_changes += changed;
-            if (changed == 0 && pass > 0) {
+            int back = 0;
+            for (std::size_t k = 0; k < cand.hits.size(); ++k) {
+                if (excluded[k] && !std::isnan(result.chi2_hit[k]) &&
+                    result.chi2_hit[k] < config_.outlier_chi2 / 2) {
+                    excluded[k] = false;
+                    ++back;
+                }
+            }
+            if (changed == 0 && back == 0) {
                 break;
             }
         }
+        out.n_outliers = static_cast<int>(std::ranges::count(excluded, true));
         return out;
     }
 
@@ -259,19 +315,12 @@ class KalmanFit {
         }
     };
 
-    // A hit whose predicted chi2 exceeds the cut is not used in the filter
-    // (typically the wrong side of its wire); its side is chosen again from
-    // the smoothed track before the refit.
-    struct OutlierFinder {
-        double chi2_cut = 16;
-        bool is_outlier(Trajectory::ConstTrackStateProxy ts) const {
-            return Acts::calculatePredictedChi2(ts) > chi2_cut;
-        }
-    };
-
     struct Result {
         FitOutput output;
         std::vector<std::optional<std::pair<Vec2, Vec2>>> smoothed;  // per candidate hit
+        // per candidate hit: residual^2 / its expected variance, against the track
+        // without the hit (for a hit left out, with its better side); NaN if unknown
+        std::vector<double> chi2_hit;
     };
 
     static Vec2 slopes_of(Acts::Vector3 const& dir) {
@@ -279,14 +328,17 @@ class KalmanFit {
     }
 
     Result fit_once(std::vector<Hit> const& hits, Candidate const& cand,
-                    std::vector<std::pair<Vec2, Vec2>> const& pred, bool reject_outliers) const {
+                    std::vector<std::pair<Vec2, Vec2>> const& pred,
+                    std::vector<bool> const& excluded) const {
         Result result;
         result.smoothed.resize(cand.hits.size());
+        result.chi2_hit.assign(cand.hits.size(), std::numeric_limits<double>::quiet_NaN());
         result.output.residuals.assign(cand.hits.size(), std::numeric_limits<double>::quiet_NaN());
 
         // measurements, ordered by z (one per layer)
         Measurements meas;
-        std::map<int, Acts::Surface const*> measured_layer;  // layer -> its hit's surface
+        std::map<int, Acts::Surface const*> measured_layer;    // layer -> its hit's surface
+        std::map<Acts::Surface const*, std::size_t> left_out;  // surface -> candidate hit
         for (std::size_t k = 0; k < cand.hits.size(); ++k) {
             auto const& a = cand.hits[k];
             auto const& h = hits[a.hit];
@@ -295,6 +347,12 @@ class KalmanFit {
             double const tm = l.meas_dir[0] * sl[0] + l.meas_dir[1] * sl[1];
             double const coord = Patrec::measured(h, a.sign, tm);
             double const centre = l.coord(l.centre[0], l.centre[1]);
+            if (excluded[k]) {
+                // on the path as a material surface only
+                measured_layer[h.layer] = surfaces_.at(h.tube).get();
+                left_out[surfaces_.at(h.tube).get()] = k;
+                continue;
+            }
             meas.list.push_back({.surface = surfaces_.at(h.tube).get(),
                                  .loc0 = coord - centre,
                                  .variance = config_.sigma * config_.sigma,
@@ -304,15 +362,19 @@ class KalmanFit {
         std::ranges::sort(meas.list, {}, [](Measurement const& m) {
             return m.surface->center(Acts::GeometryContext::dangerouslyDefaultConstruct()).z();
         });
+        if (meas.list.size() < 5) {
+            return result;
+        }
         std::vector<Acts::SourceLink> source_links;
         for (std::size_t i = 0; i < meas.list.size(); ++i) {
             source_links.emplace_back(MufluxSourceLink{i});
         }
         // the surfaces in z order, from the first measured layer to the last:
-        // the hit's tube surface where the layer has one, else (with material)
-        // the layer's plane
+        // the hit's tube surface where the layer has one (a hit left out keeps
+        // its surface, for its material and its residual), else (with
+        // material) the layer's plane
         std::vector<Acts::Surface const*> sequence;
-        int const first_layer = measured_layer.begin()->first;
+        int const first_layer = hits[cand.hits[meas.list.front().cand_hit].hit].layer;
         int const last_layer = measured_layer.rbegin()->first;
         for (int li = first_layer; li <= last_layer; ++li) {
             if (auto const it = measured_layer.find(li); it != measured_layer.end()) {
@@ -361,10 +423,6 @@ class KalmanFit {
         ext.calibrator.template connect<&Measurements::calibrate<Trajectory>>(&meas);
         ext.updater.template connect<&Acts::GainMatrixUpdater::operator()<Trajectory>>(&updater);
         ext.smoother.template connect<&Acts::GainMatrixSmoother::operator()<Trajectory>>(&smoother);
-        OutlierFinder const outliers{config_.outlier_chi2};
-        if (reject_outliers) {
-            ext.outlierFinder.template connect<&OutlierFinder::is_outlier>(&outliers);
-        }
 
         Acts::MagneticFieldContext const mctx;
         Acts::CalibrationContext const cctx;
@@ -398,37 +456,57 @@ class KalmanFit {
 
         double zmin = std::numeric_limits<double>::max();
         double zmax = std::numeric_limits<double>::lowest();
+        auto const to_global = [&](auto const& ts, Acts::BoundVector const& v) {
+            double const phi = v[Acts::eBoundPhi], theta = v[Acts::eBoundTheta];
+            Acts::Vector3 const d(std::sin(theta) * std::cos(phi), std::sin(theta) * std::sin(phi),
+                                  std::cos(theta));
+            Acts::Vector3 const pos = ts.referenceSurface().localToGlobal(
+                gctx_, Acts::Vector2{v[Acts::eBoundLoc0], v[Acts::eBoundLoc1]}, d);
+            return std::pair{pos, d};
+        };
+        double const var = config_.sigma * config_.sigma;
         tracks.trackStateContainer().visitBackwards(track.tipIndex(), [&](auto ts) {
-            bool const outlier = ts.typeFlags().isOutlier();
-            if (!(ts.typeFlags().isMeasurement() || outlier) || !ts.hasSmoothed()) {
+            if (!ts.hasSmoothed()) {
+                return true;
+            }
+            Acts::BoundVector const s = ts.smoothed();
+            if (!ts.typeFlags().isMeasurement()) {
+                // a hit left out: its residual with its better side, against the
+                // track, which does not contain it
+                auto const it = left_out.find(&ts.referenceSurface());
+                if (it == left_out.end()) {
+                    return true;
+                }
+                std::size_t const k = it->second;
+                auto const& h = hits[cand.hits[k].hit];
+                auto const& l = geometry_.layers()[h.layer];
+                auto const [pos, d] = to_global(ts, s);
+                Vec2 const sl = slopes_of(d);
+                double const tm = l.meas_dir[0] * sl[0] + l.meas_dir[1] * sl[1];
+                double const centre = l.coord(l.centre[0], l.centre[1]);
+                double best = std::numeric_limits<double>::max();
+                for (int sign : {+1, -1}) {
+                    double const r = Patrec::measured(h, sign, tm) - centre - s[Acts::eBoundLoc0];
+                    best = std::min(best, r * r);
+                }
+                double const c = ts.smoothedCovariance()(Acts::eBoundLoc0, Acts::eBoundLoc0);
+                result.chi2_hit[k] = best / (var + c);
+                result.smoothed[k] = std::pair{Vec2{pos.x(), pos.y()}, sl};
                 return true;
             }
             auto const sl = ts.getUncalibratedSourceLink().template get<MufluxSourceLink>();
             auto const& m = meas.list[sl.index];
-            auto const to_global = [&](Acts::BoundVector const& v) {
-                double const phi = v[Acts::eBoundPhi], theta = v[Acts::eBoundTheta];
-                Acts::Vector3 const d(std::sin(theta) * std::cos(phi),
-                                      std::sin(theta) * std::sin(phi), std::cos(theta));
-                Acts::Vector3 const pos = ts.referenceSurface().localToGlobal(
-                    gctx_, Acts::Vector2{v[Acts::eBoundLoc0], v[Acts::eBoundLoc1]}, d);
-                return std::pair{pos, d};
-            };
-            Acts::BoundVector const s = ts.smoothed();
-            auto const [pos, d] = to_global(s);
+            auto const [pos, d] = to_global(ts, s);
             // the track without this hit: for its residual and its side
-            Acts::BoundVector const u =
-                outlier
-                    ? s
-                    : Acts::calculateUnbiasedParametersCovariance(Acts::AnyConstTrackStateProxy{ts})
-                          .first;
-            auto const [upos, ud] = to_global(u);
+            auto const [u, ucov] =
+                Acts::calculateUnbiasedParametersCovariance(Acts::AnyConstTrackStateProxy{ts});
+            auto const [upos, ud] = to_global(ts, u);
             double const pabs = std::abs(1 / s[Acts::eBoundQOverP]) / Acts::UnitConstants::GeV;
-            if (!outlier) {
-                ++out.n_meas;
-            } else {
-                ++out.n_outliers;
-            }
-            out.residuals[m.cand_hit] = m.loc0 - u[Acts::eBoundLoc0];
+            ++out.n_meas;
+            double const r = m.loc0 - u[Acts::eBoundLoc0];
+            out.residuals[m.cand_hit] = r;
+            result.chi2_hit[m.cand_hit] =
+                r * r / (m.variance + ucov(Acts::eBoundLoc0, Acts::eBoundLoc0));
             result.smoothed[m.cand_hit] = std::pair{Vec2{upos.x(), upos.y()}, slopes_of(ud)};
             if (pos.z() < zmin) {
                 zmin = pos.z();
