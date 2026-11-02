@@ -51,6 +51,17 @@ struct MufluxTracks {
     /// simulation: most frequent track among the hits, and its fraction (-1, 0 for data)
     std::vector<std::int32_t> true_track;
     std::vector<float> true_frac;
+    /// RPC matching (MufluxRpc.hpp; NaN without an RPC strip table): the track
+    /// straight from its last state at RPC station 1, minus the nearest RPC track
+    /// in x and in y, and its distance to the nearest fired strip per station
+    std::vector<float> x_rpc1, y_rpc1, dx_rpc1, dy_rpc1;
+    std::vector<float> rpc_dist1, rpc_dist2, rpc_dist3, rpc_dist4, rpc_dist5;
+    std::vector<std::int32_t> n_rpc_stations;  ///< stations with a strip within rpc_station_dist
+
+    /// the event's RPC tracks (not parallel to the tracks): coord = slope * z + intercept
+    /// [mm], direction 0 measures y, 1 measures x
+    std::vector<std::int32_t> rpc_track_direction;
+    std::vector<float> rpc_track_slope, rpc_track_intercept;
 };
 
 }  // namespace SHiP::trout::muflux

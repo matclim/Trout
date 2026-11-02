@@ -18,8 +18,12 @@
 //   tube_wall_density  of the drift-tube walls in g/cm3 (default 2.699, aluminium; 0.9 for
 //               simulations from the legacy geometry, whose walls are "CoilAluminium")
 //   coils       the Goliath coils in the fit's material model (default true)
+//   rpc_table   RPC strip table (rpc_strips.txt, exported from the geometry; default null: no
+//               RPC matching)
+//   rpc_dead    RPC strips to ignore: 'legacy' (default; inactive in 2018, firing in the
+//               simulation) or 'none'
 function(infile, events, wire_table, field_map, map='goliath_2018', out='muflux_tracks.root',
-         sigma=0.27, tube_wall_density=2.699, coils=true)
+         sigma=0.27, tube_wall_density=2.699, coils=true, rpc_table=null, rpc_dead='legacy')
   {
     stage: 'reconstruction',
     driver: {
@@ -49,6 +53,8 @@ function(infile, events, wire_table, field_map, map='goliath_2018', out='muflux_
         sigma: sigma,
         tube_wall_density: tube_wall_density,
         coils: coils,
+        [if rpc_table != null then 'rpc_table']: rpc_table,
+        rpc_dead: rpc_dead,
       },
       output: {
         cpp: 'muflux_tracks_output',

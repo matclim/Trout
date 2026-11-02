@@ -42,13 +42,40 @@ class TracksWriter {
         for (auto const* n : {"n_digits", "n_unknown", "n_upstream_only", "n_rpc"}) {
             i32(n);
         }
-        for (auto const* n : {"q", "fit_ok", "ndf", "n_hits", "n_x_up", "n_stereo", "n_down",
-                              "lr_changes", "n_outliers", "true_track"}) {
+        for (auto const* n :
+             {"q", "fit_ok", "ndf", "n_hits", "n_x_up", "n_stereo", "n_down", "lr_changes",
+              "n_outliers", "true_track", "n_rpc_stations", "rpc_track_direction"}) {
             ivecs_.emplace_back(model->MakeField<std::vector<std::int32_t>>(n));
         }
-        for (auto const* n :
-             {"p", "sigma_p", "chi2", "p_patrec", "match_dx", "x0", "y0", "z0", "px0", "py0", "pz0",
-              "x1", "y1", "z1", "px1", "py1", "pz1", "true_frac"}) {
+        for (auto const* n : {"p",
+                              "sigma_p",
+                              "chi2",
+                              "p_patrec",
+                              "match_dx",
+                              "x0",
+                              "y0",
+                              "z0",
+                              "px0",
+                              "py0",
+                              "pz0",
+                              "x1",
+                              "y1",
+                              "z1",
+                              "px1",
+                              "py1",
+                              "pz1",
+                              "true_frac",
+                              "x_rpc1",
+                              "y_rpc1",
+                              "dx_rpc1",
+                              "dy_rpc1",
+                              "rpc_dist1",
+                              "rpc_dist2",
+                              "rpc_dist3",
+                              "rpc_dist4",
+                              "rpc_dist5",
+                              "rpc_track_slope",
+                              "rpc_track_intercept"}) {
             fvecs_.emplace_back(model->MakeField<std::vector<float>>(n));
         }
         writer_ = ROOT::RNTupleWriter::Recreate(std::move(model), "muflux_tracks", filename);
@@ -63,15 +90,42 @@ class TracksWriter {
             *ints_[i] = ints[i];
         }
         std::vector<std::int32_t> const* ivecs[] = {
-            &t.q,        &t.fit_ok, &t.ndf,        &t.n_hits,     &t.n_x_up,
-            &t.n_stereo, &t.n_down, &t.lr_changes, &t.n_outliers, &t.true_track};
+            &t.q,          &t.fit_ok,         &t.ndf,
+            &t.n_hits,     &t.n_x_up,         &t.n_stereo,
+            &t.n_down,     &t.lr_changes,     &t.n_outliers,
+            &t.true_track, &t.n_rpc_stations, &t.rpc_track_direction};
         for (std::size_t i = 0; i < ivecs_.size(); ++i) {
             *ivecs_[i] = *ivecs[i];
         }
-        std::vector<float> const* fvecs[] = {
-            &t.p,  &t.sigma_p, &t.chi2, &t.p_patrec, &t.match_dx, &t.x0,
-            &t.y0, &t.z0,      &t.px0,  &t.py0,      &t.pz0,      &t.x1,
-            &t.y1, &t.z1,      &t.px1,  &t.py1,      &t.pz1,      &t.true_frac};
+        std::vector<float> const* fvecs[] = {&t.p,
+                                             &t.sigma_p,
+                                             &t.chi2,
+                                             &t.p_patrec,
+                                             &t.match_dx,
+                                             &t.x0,
+                                             &t.y0,
+                                             &t.z0,
+                                             &t.px0,
+                                             &t.py0,
+                                             &t.pz0,
+                                             &t.x1,
+                                             &t.y1,
+                                             &t.z1,
+                                             &t.px1,
+                                             &t.py1,
+                                             &t.pz1,
+                                             &t.true_frac,
+                                             &t.x_rpc1,
+                                             &t.y_rpc1,
+                                             &t.dx_rpc1,
+                                             &t.dy_rpc1,
+                                             &t.rpc_dist1,
+                                             &t.rpc_dist2,
+                                             &t.rpc_dist3,
+                                             &t.rpc_dist4,
+                                             &t.rpc_dist5,
+                                             &t.rpc_track_slope,
+                                             &t.rpc_track_intercept};
         for (std::size_t i = 0; i < fvecs_.size(); ++i) {
             *fvecs_[i] = *fvecs[i];
         }

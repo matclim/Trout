@@ -222,6 +222,9 @@ target_include_directories(
 )
 target_link_libraries(muflux_kalman_test PRIVATE Acts::Core)
 add_test(NAME muflux_kalman COMMAND muflux_kalman_test)
+add_executable(muflux_rpc_test tests/muflux_rpc_test.cpp)
+target_include_directories(muflux_rpc_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME muflux_rpc COMMAND muflux_rpc_test)
 
 # Smoke-test input generator (build-only, not installed)
 add_executable(make_test_input tools/make_test_input.cpp)

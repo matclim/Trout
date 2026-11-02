@@ -31,12 +31,17 @@
 //                   legacy geometry's "CoilCopper" and "CoilAluminium")
 //   coil_step       spacing of the planes sampling the coils [mm] (50)
 //   coil_margin     a plane joins a candidate's path this close to a coil [mm] (100)
+//   rpc_table       RPC strip table (rpc_strips.txt; default empty: no RPC matching)
+//   rpc_dead        strips to ignore: "legacy" (default: the strips inactive in 2018,
+//                   which fire in the simulation) or "none"
+//   rpc_station_dist  a fired strip this close counts its station in n_rpc_stations [mm] (100)
 
 #include "acts_field_provider.hpp"
 #include "detectors/muflux/MufluxEvent.hpp"
 #include "detectors/muflux/MufluxGeometry.hpp"
 #include "detectors/muflux/MufluxKalman.hpp"
 #include "detectors/muflux/MufluxPatrec.hpp"
+#include "detectors/muflux/MufluxRpc.hpp"
 #include "phlex/core/product_selector.hpp"
 #include "phlex/module.hpp"
 
@@ -48,6 +53,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <spdlog/fmt/fmt.h>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
@@ -72,10 +78,21 @@ std::string coil_summary(mf::KalmanFit::Config const& k) {
 
 class Tracker {
    public:
-    Tracker(std::string const& wire_table, mf::PatrecConfig patrec, mf::KalmanFit::Config kalman)
+    Tracker(std::string const& wire_table, mf::PatrecConfig patrec, mf::KalmanFit::Config kalman,
+            std::string const& rpc_table, mf::RpcConfig rpc)
         : geometry_{mf::read_wire_table(wire_table)},
           patrec_config_{patrec},
           kalman_config_{kalman} {
+        if (!rpc_table.empty()) {
+            rpc_.emplace(mf::read_rpc_table(rpc_table), std::move(rpc));
+            spdlog::info(
+                "muflux_tracking: RPC strips from '{}', station 1 at z {:.1f} mm, {} dead strips "
+                "ignored, stations counted within {} mm",
+                rpc_table, rpc_->z_station1(), rpc_->config().dead.size(),
+                rpc_->config().station_dist);
+        } else {
+            spdlog::info("muflux_tracking: no RPC strip table, no RPC matching");
+        }
         spdlog::info("muflux_tracking: {} drift-tube layers from '{}'", geometry_.layers().size(),
                      wire_table);
         spdlog::info(
@@ -123,6 +140,18 @@ class Tracker {
 
         auto cands = patrec_->find(hits);
         double const z_first = geometry_.layers().front().z;
+        // RPC tracks of the event
+        std::vector<mf::RpcStrip> rpc_fired;
+        std::vector<mf::RpcTrack> rpc_tracks;
+        if (rpc_) {
+            rpc_fired = rpc_->fired(d.rpc_id);
+            rpc_tracks = rpc_->tracks(rpc_->clusters(rpc_fired));
+            for (auto const& t : rpc_tracks) {
+                out.rpc_track_direction.push_back(t.direction);
+                out.rpc_track_slope.push_back(static_cast<float>(t.slope));
+                out.rpc_track_intercept.push_back(static_cast<float>(t.intercept));
+            }
+        }
         for (auto& c : cands) {
             if (!c.matched) {
                 ++out.n_upstream_only;
@@ -197,6 +226,32 @@ class Tracker {
             }
             out.true_track.push_back(true_track);
             out.true_frac.push_back(true_frac);
+            // RPC matching, straight from the last fitted state (or from the
+            // tracklet behind the magnet if the fit failed)
+            mf::RpcMatch rm;
+            rm.station_dist.fill(std::nan(""));
+            if (rpc_) {
+                if (fit.ok) {
+                    auto const& l = fit.last;
+                    rm = rpc_->match(l.position.x(), l.position.y(), l.position.z(),
+                                     l.momentum.x() / l.momentum.z(),
+                                     l.momentum.y() / l.momentum.z(), rpc_fired, rpc_tracks);
+                } else {
+                    auto const xy = c.position(c.z_ref_down, true);
+                    auto const t = c.slopes(true);
+                    rm = rpc_->match(xy[0], xy[1], c.z_ref_down, t[0], t[1], rpc_fired, rpc_tracks);
+                }
+            }
+            out.x_rpc1.push_back(static_cast<float>(rm.x1));
+            out.y_rpc1.push_back(static_cast<float>(rm.y1));
+            out.dx_rpc1.push_back(static_cast<float>(rm.dx1));
+            out.dy_rpc1.push_back(static_cast<float>(rm.dy1));
+            std::vector<float>* dist[] = {&out.rpc_dist1, &out.rpc_dist2, &out.rpc_dist3,
+                                          &out.rpc_dist4, &out.rpc_dist5};
+            for (int k = 0; k < 5; ++k) {
+                dist[k]->push_back(static_cast<float>(rm.station_dist[k]));
+            }
+            out.n_rpc_stations.push_back(rm.n_stations);
             ++matched_;
         }
         ++events_;
@@ -240,6 +295,7 @@ class Tracker {
     mf::Geometry geometry_;
     mf::PatrecConfig patrec_config_;
     mf::KalmanFit::Config kalman_config_;
+    std::optional<mf::Rpc> rpc_;
     std::once_flag init_;
     std::unique_ptr<mf::Patrec> patrec_;
     std::unique_ptr<mf::KalmanFit> kalman_;
@@ -274,7 +330,18 @@ PHLEX_REGISTER_ALGORITHMS(m, config) {
     kalman.coil_step = config.get<double>("coil_step", double{kalman.coil_step});
     kalman.coil_margin = config.get<double>("coil_margin", double{kalman.coil_margin});
 
-    auto tracker = std::make_shared<Tracker>(config.get<std::string>("wire_table"), patrec, kalman);
+    mf::RpcConfig rpc;
+    auto const dead = config.get<std::string>("rpc_dead", std::string{"legacy"});
+    if (dead == "none") {
+        rpc.dead.clear();
+    } else if (dead != "legacy") {
+        throw std::invalid_argument("muflux_tracking: rpc_dead must be 'legacy' or 'none'");
+    }
+    rpc.station_dist = config.get<double>("rpc_station_dist", double{rpc.station_dist});
+
+    auto tracker = std::make_shared<Tracker>(config.get<std::string>("wire_table"), patrec, kalman,
+                                             config.get<std::string>("rpc_table", std::string{}),
+                                             std::move(rpc));
 
     m.transform(
          "muflux_tracking",
