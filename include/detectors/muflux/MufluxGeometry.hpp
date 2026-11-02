@@ -139,9 +139,14 @@ inline double mean_wall_thickness(Layer const& l, double wall) {
 class Geometry {
    public:
     /// z_spread_mm: largest z difference between the tubes of a layer;
-    /// z_tolerance_mm: between the two ends of a wire.
+    /// z_tolerance_mm: between the two ends of a wire; parallel_tolerance: of
+    /// the wire directions within a layer; stereo_sin: a layer whose wires are
+    /// tilted from the vertical by more than this (sine) is a stereo layer. The
+    /// stereo views are at 60 degrees; the x layers of an aligned geometry can
+    /// be rotated by a few mrad (T2 x by 6.5 mrad in 2018) and stay x layers.
     explicit Geometry(std::map<std::int32_t, WireEnds> const& wires, double z_spread_mm = 10.0,
-                      double z_tolerance_mm = 0.5, double parallel_tolerance = 1e-3) {
+                      double z_tolerance_mm = 0.5, double parallel_tolerance = 1e-3,
+                      double stereo_sin = 0.1) {
         std::map<std::int32_t, std::vector<std::pair<std::int32_t, WireEnds>>> by_layer;
         for (auto const& [id, w] : wires) {
             by_layer[id / 10000].emplace_back(id, w);
@@ -167,7 +172,7 @@ class Geometry {
             }
             l.wire_dir = d;
             l.meas_dir = {d[1], -d[0]};
-            l.stereo = std::abs(d[0]) > parallel_tolerance;
+            l.stereo = std::abs(d[0]) > stereo_sin;
             l.radius = w0.radius;
             double zsum = 0;
             double min_coord = std::numeric_limits<double>::max();

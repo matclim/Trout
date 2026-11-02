@@ -41,6 +41,27 @@ int main(int argc, char** argv) {
         check(std::abs(cross - 1) < 1e-12, "meas_dir x wire_dir = +z");
     }
     check(nstereo == 8, "8 stereo layers");
+    {
+        // an aligned geometry: the T2 x layers rotated by 6.5 mrad stay x layers
+        auto tilted = wires;
+        double const a = 6.5e-3;
+        for (auto& [id, w] : tilted) {
+            if (id / 1000000 != 21) {
+                continue;
+            }
+            for (auto* e : {&w.end1, &w.end2}) {
+                double const x = (*e)[0], y = (*e)[1];
+                (*e)[0] = x * std::cos(a) - y * std::sin(a);
+                (*e)[1] = x * std::sin(a) + y * std::cos(a);
+            }
+        }
+        mf::Geometry const geo_tilted{tilted};
+        int n = 0;
+        for (auto const& l : geo_tilted.layers()) {
+            n += l.stereo;
+        }
+        check(n == 8, "x layers rotated by a few mrad are not stereo layers");
+    }
     check(geo.layers().front().z < geo.layers().back().z, "layers ordered by z");
     {
         auto const& l = geo.layers()[geo.layer_index(10002001)];
