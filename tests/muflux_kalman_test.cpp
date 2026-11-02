@@ -184,6 +184,59 @@ int main(int argc, char** argv) {
         check(q0.width > pl.width, "the material model narrows the pulls");
     }
 
+    // steep muons (ty -0.09..-0.06) through the lower Goliath coil: fitted with
+    // the coils in the material model, and without them
+    {
+        std::vector<double> pull_c, dp_c, pull_n, dp_n;
+        long n_coil = 0, n_fit_c = 0, n_fit_n = 0;
+        mf::KalmanFit::Config no_coils;
+        no_coils.coils = false;
+        mf::KalmanFit const kf_n{geo, std::make_shared<ToyField>(field), no_coils};
+        check(kf.coil_planes() > 50, "coil planes built");
+        check(kf_n.coil_planes() == 0, "no coil planes without coils");
+        for (int pass = 0; pass < 2; ++pass) {
+            Generator g{geo, field, 20181021, 0.0};
+            g.set_coils(mf::goliath_2018_coils());
+            g.set_slopes(-80, 0, -0.09, -0.06);
+            auto const& fitter = pass == 0 ? kf : kf_n;
+            for (int ev_n = 0; ev_n < 1000; ++ev_n) {
+                auto const ev = g.next();
+                auto const& mu = ev.muons[0];
+                if (mu.p > 50) {
+                    continue;  // scattering matters at low momentum
+                }
+                auto cands = patrec.find(ev.hits);
+                int const best = best_candidate(ev, cands, 0);
+                if (best < 0) {
+                    continue;
+                }
+                n_coil += pass == 0;
+                auto const fit = fitter.fit(ev.hits, cands[best], patrec);
+                if (!fit.ok) {
+                    continue;
+                }
+                (pass == 0 ? n_fit_c : n_fit_n) += 1;
+                (pass == 0 ? pull_c : pull_n).push_back((fit.p - mu.p) / fit.sigma_p);
+                (pass == 0 ? dp_c : dp_n).push_back(fit.p / mu.p - 1);
+            }
+        }
+        auto const pc = Quantiles{pull_c}, pn = Quantiles{pull_n}, dc = Quantiles{dp_c},
+                   dn = Quantiles{dp_n};
+        std::printf(
+            "  steep muons through the coil (< 50 GeV, %ld candidates): with the coils p pull "
+            "median %.3f width %.3f, p_fit/p_true - 1 median %.4f width %.4f, |pull| > 4: %ld; "
+            "without: pull median %.3f width %.3f, p_fit/p_true - 1 median %.4f width %.4f, "
+            "|pull| > 4: %ld\n",
+            n_coil, pc.median, pc.width, dc.median, dc.width, Quantiles::tail(pull_c, 4), pn.median,
+            pn.width, dn.median, dn.width, Quantiles::tail(pull_n, 4));
+        check(n_coil > 300, "steep muons found");
+        check(n_fit_c > 0.98 * n_coil, "fits through the coils converge");
+        check(std::abs(pc.median) < 0.3 && pc.width > 0.7 && pc.width < 1.3,
+              "p pulls with the coils");
+        check(std::abs(dc.median) < 0.003, "no momentum bias with the coils");
+        check(pn.width > 1.3 * pc.width, "the coil model narrows the pulls");
+    }
+
     if (failures == 0) {
         std::puts("muflux_kalman: all checks passed");
     }

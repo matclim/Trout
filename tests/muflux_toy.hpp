@@ -12,8 +12,10 @@
 // and one digit per tube. At every layer the muon scatters (Highland's
 // formula) and loses energy (mean dE/dx of a muon in aluminium) in the
 // layer's mean tube-wall thickness, the material model of MufluxKalman.hpp;
-// `wall` = 0 turns this off. The layout follows the 2018 one (T1 x-u, T2 v-x, T3
-// and T4 x; 60 degree stereo), with invented T3/T4 tube positions.
+// `wall` = 0 turns this off. With set_coils, the muons also scatter and lose
+// energy in the magnet coils (in 50 mm steps), and set_slopes makes steep muons
+// that reach them. The layout follows the 2018 one (T1 x-u, T2 v-x, T3 and T4 x;
+// 60 degree stereo), with invented T3/T4 tube positions.
 
 #pragma once
 
@@ -237,6 +239,15 @@ class Generator {
               double wall = 0.85)
         : geo_{geo}, field_{std::move(field)}, rng_{seed}, two_muon_{two_muon}, wall_{wall} {}
 
+    /// Muons also cross these coils (scattering and energy loss).
+    void set_coils(std::vector<mf::Coil> coils) { coils_ = std::move(coils); }
+
+    /// Start positions and slopes: y0 in [y_lo, y_hi] mm, ty in [ty_lo, ty_hi]
+    /// (default -80..80 mm, -0.03..0.03); x0 and tx as by default.
+    void set_slopes(double y_lo, double y_hi, double ty_lo, double ty_hi) {
+        y_lo_ = y_lo, y_hi_ = y_hi, ty_lo_ = ty_lo, ty_hi_ = ty_hi;
+    }
+
     Event next() {
         Event ev;
         int const n_mu = 1 + (u01_(rng_) < two_muon_);
@@ -245,14 +256,13 @@ class Generator {
             Muon mu;
             mu.p = 5 * std::pow(60., u01_(rng_));  // 5 - 300 GeV, log-uniform
             mu.q = u01_(rng_) < 0.5 ? -1 : 1;
-            State s{-80 + 160 * u01_(rng_), -80 + 160 * u01_(rng_), -0.03 + 0.06 * u01_(rng_),
-                    -0.03 + 0.06 * u01_(rng_)};
+            State s{-80 + 160 * u01_(rng_), y_lo_ + (y_hi_ - y_lo_) * u01_(rng_),
+                    -0.03 + 0.06 * u01_(rng_), ty_lo_ + (ty_hi_ - ty_lo_) * u01_(rng_)};
             double z = 0;
             double p = mu.p;  // falls with the energy loss
             for (int li = 0; li < static_cast<int>(geo_.layers().size()); ++li) {
                 auto const& l = geo_.layers()[li];
-                s = propagate(s, z, l.z, mu.q / p, field_);
-                z = l.z;
+                advance(s, z, l.z, p, mu.q);
                 if (li == 0) {
                     mu.first = s;
                 }
@@ -314,14 +324,38 @@ class Generator {
     }
 
    private:
+    // From z to z1 through the field, in 50 mm steps (as the fit samples the
+    // coils) with the coil material
+    // where the muon is inside a coil.
+    void advance(State& s, double& z, double z1, double& p, int q) {
+        if (coils_.empty()) {
+            s = propagate(s, z, z1, q / p, field_);
+            z = z1;
+            return;
+        }
+        while (z < z1) {
+            double const zn = std::min(z1, z + 50.);
+            s = propagate(s, z, zn, q / p, field_);
+            double const zm = 0.5 * (z + zn);
+            for (auto const& c : coils_) {
+                double const dx = s.x - c.centre[0], dz = zm - c.centre[2];
+                if (dx * dx + dz * dz < c.radius * c.radius &&
+                    std::abs(s.y - c.centre[1]) < c.half_height) {
+                    // X0 in mm; mean dE/dx of 1.75 MeV cm2/g, as in aluminium
+                    scatter(s, p, zn - z, c.x0 / c.density * 10, 1.75e-4 * c.density);
+                }
+            }
+            z = zn;
+        }
+    }
+
     // Multiple scattering (Highland) and mean energy loss of a muon crossing
-    // `t` mm of aluminium along z, applied at the layer.
-    void scatter(State& s, double& p, double t) {
+    // `t` mm along z of a material (default: aluminium, the tube walls).
+    void scatter(State& s, double& p, double t, double x0 = 88.97 /* mm */,
+                 double dedx = 0.48e-3 /* GeV/mm, mean for 5-300 GeV muons in aluminium */) {
         if (!(t > 0)) {
             return;
         }
-        constexpr double x0 = 88.97;      // mm
-        constexpr double dedx = 0.48e-3;  // GeV/mm, mean for 5-300 GeV muons in aluminium
         double const n = std::sqrt(1 + s.tx * s.tx + s.ty * s.ty);
         double const x = t * n / x0;
         double const theta0 = 0.0136 / p * std::sqrt(x) * (1 + 0.038 * std::log(x));
@@ -336,6 +370,8 @@ class Generator {
     std::mt19937_64 rng_;
     double two_muon_;
     double wall_;
+    std::vector<mf::Coil> coils_;
+    double y_lo_ = -80, y_hi_ = 80, ty_lo_ = -0.03, ty_hi_ = 0.03;
     std::uniform_real_distribution<double> u01_{0, 1};
     std::normal_distribution<double> gauss_{0, 1};
     std::poisson_distribution<int> noise_{2.0};

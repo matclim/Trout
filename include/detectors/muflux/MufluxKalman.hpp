@@ -36,6 +36,15 @@
 // surface of its hit in that layer, or the layer's plane if it has none. The
 // gas (Ar/CO2) and the air are left out (< 0.1% of a radiation length per
 // layer, about 2% for the air between T1 and T4).
+//
+// Coils (option `coils`, with `material`): the Goliath coils sit above and
+// below the gap, inside the field, and steep tracks (|ty| >~ 0.04) cross up to
+// 3 m of them between T2 and T3, losing up to ~1 GeV and scattering by a
+// few mrad. Each coil is a homogeneous cylinder with a vertical axis
+// (goliath_2018_coils: the legacy geometry's). The fit samples them with planes
+// normal to z every coil_step mm, each carrying, inside the coil's cross-section
+// at its z, a slab of the coil material as thick as the plane spacing; the
+// planes a candidate passes within coil_margin mm of a coil join its path.
 
 #pragma once
 
@@ -55,6 +64,7 @@
 #include <Acts/MagneticField/MagneticFieldContext.hpp>
 #include <Acts/MagneticField/MagneticFieldProvider.hpp>
 #include <Acts/Material/HomogeneousSurfaceMaterial.hpp>
+#include <Acts/Material/ISurfaceMaterial.hpp>
 #include <Acts/Material/Material.hpp>
 #include <Acts/Material/MaterialSlab.hpp>
 #include <Acts/Propagator/DirectNavigator.hpp>
@@ -66,6 +76,7 @@
 #include <Acts/TrackFitting/GainMatrixSmoother.hpp>
 #include <Acts/TrackFitting/GainMatrixUpdater.hpp>
 #include <Acts/TrackFitting/KalmanFitter.hpp>
+#include <Acts/Utilities/AxisDefinitions.hpp>
 #include <Acts/Utilities/CalibrationContext.hpp>
 #include <Acts/Utilities/Logger.hpp>
 #include <Acts/Utilities/TrackHelpers.hpp>
@@ -79,10 +90,56 @@
 #include <memory>
 #include <numbers>
 #include <optional>
+#include <ostream>
 #include <utility>
 #include <vector>
 
 namespace SHiP::trout::muflux {
+
+/// Material of a plane normal to z, placed at x = y = 0 (local = global x, y):
+/// a slab in each of a few rectangles, nothing elsewhere.
+class RegionMaterial final : public Acts::ISurfaceMaterial {
+   public:
+    struct Region {
+        double x0 = 0, x1 = 0, y0 = 0, y1 = 0;  ///< mm
+        Acts::MaterialSlab slab;
+        [[nodiscard]] bool contains(double x, double y) const {
+            return x >= x0 && x < x1 && y >= y0 && y < y1;
+        }
+    };
+
+    explicit RegionMaterial(std::vector<Region> regions) : regions_{std::move(regions)} {}
+
+    std::vector<Acts::AxisDirection> localAxisDirections() const override { return {}; }
+
+    RegionMaterial& scale(double factor) override {
+        for (auto& r : regions_) {
+            r.slab.scaleThickness(static_cast<float>(factor));
+        }
+        return *this;
+    }
+
+    Acts::MaterialSlab const& materialSlab(Acts::Vector2 const& lp) const override {
+        for (auto const& r : regions_) {
+            if (r.contains(lp[0], lp[1])) {
+                return r.slab;
+            }
+        }
+        return nothing_;
+    }
+    using Acts::ISurfaceMaterial::materialSlab;
+
+    std::ostream& toStream(std::ostream& os) const override {
+        os << "muflux RegionMaterial: " << regions_.size() << " regions\n";
+        return os;
+    }
+
+    [[nodiscard]] std::vector<Region> const& regions() const { return regions_; }
+
+   private:
+    std::vector<Region> regions_;
+    Acts::MaterialSlab nothing_ = Acts::MaterialSlab::Nothing();
+};
 
 /// Source link of a muflux measurement: its index in the fit's measurements.
 struct MufluxSourceLink {
@@ -128,6 +185,10 @@ class KalmanFit {
         bool material = true;           ///< multiple scattering and energy loss in the tube walls
         double tube_wall = 0.85;        ///< aluminium wall of the drift tubes [mm]
         double tube_wall_density = 2.699;  ///< of the walls [g/cm3]; 0.9 in the legacy geometry
+        bool coils = true;                 ///< the magnet coils (with `material`)
+        std::vector<Coil> coil_list = goliath_2018_coils();
+        double coil_step = 50;     ///< spacing of the planes sampling the coils [mm]
+        double coil_margin = 100;  ///< a plane joins a candidate's path this close to a coil [mm]
     };
 
     KalmanFit(Geometry const& geometry, std::shared_ptr<const Acts::MagneticFieldProvider> field,
@@ -182,6 +243,9 @@ class KalmanFit {
             }
             layer_surfaces_.push_back(std::move(plane));
         }
+        if (config_.material && config_.coils) {
+            build_coil_planes();
+        }
         Stepper stepper(std::move(field));
         Acts::DirectNavigator navigator{
             Acts::getDefaultLogger("MufluxDirectNavigator", Acts::Logging::WARNING)};
@@ -193,6 +257,9 @@ class KalmanFit {
 
     /// The plane surface of a tube.
     Acts::Surface const& surface(std::int32_t tube) const { return *surfaces_.at(tube); }
+
+    /// Number of planes sampling the coils (0 without coils).
+    [[nodiscard]] std::size_t coil_planes() const { return coil_planes_.size(); }
 
     /// Fit a matched candidate; its hit sides are updated from the fit.
     FitOutput fit(std::vector<Hit> const& hits, Candidate& cand, Patrec const& patrec) const {
@@ -383,6 +450,32 @@ class KalmanFit {
                 sequence.push_back(layer_surfaces_[li].get());
             }
         }
+        // the coil planes between the first and the last surface that the
+        // candidate passes close to a coil, in z order
+        if (!coil_planes_.empty()) {
+            double const z_front = sequence.front()->center(gctx_).z();
+            double const z_back = sequence.back()->center(gctx_).z();
+            bool added = false;
+            for (auto const& cp : coil_planes_) {
+                if (cp.z <= z_front || cp.z >= z_back) {
+                    continue;
+                }
+                Vec2 const xy = cand.position(cp.z, cp.z > cp.z_centre);
+                double const m = config_.coil_margin;
+                for (auto const& r : cp.material->regions()) {
+                    if (xy[0] > r.x0 - m && xy[0] < r.x1 + m && xy[1] > r.y0 - m &&
+                        xy[1] < r.y1 + m) {
+                        sequence.push_back(cp.surface.get());
+                        added = true;
+                        break;
+                    }
+                }
+            }
+            if (added) {
+                std::ranges::stable_sort(
+                    sequence, {}, [&](Acts::Surface const* s) { return s->center(gctx_).z(); });
+            }
+        }
 
         // start parameters on the first measured layer, from the candidate
         auto const& first = *meas.list.front().surface;
@@ -521,11 +614,77 @@ class KalmanFit {
         return result;
     }
 
+    // Planes normal to z every coil_step mm over the z range of the coils, each
+    // with the cross-section of every coil it cuts (the coil's chord in x at the
+    // plane's z, its full height in y), a slab as thick as the plane spacing.
+    void build_coil_planes() {
+        using Acts::UnitConstants::cm;
+        using Acts::UnitConstants::cm3;
+        using Acts::UnitConstants::g;
+        auto const& coils = config_.coil_list;
+        if (coils.empty() || !(config_.coil_step > 0)) {
+            return;
+        }
+        double z_lo = std::numeric_limits<double>::max();
+        double z_hi = std::numeric_limits<double>::lowest();
+        double z_centre = 0;
+        for (auto const& c : coils) {
+            z_lo = std::min(z_lo, c.centre[2] - c.radius);
+            z_hi = std::max(z_hi, c.centre[2] + c.radius);
+            z_centre += c.centre[2] / static_cast<double>(coils.size());
+        }
+        int const n = std::max(1, static_cast<int>(std::ceil((z_hi - z_lo) / config_.coil_step)));
+        double const step = (z_hi - z_lo) / n;
+        auto const bounds = std::make_shared<Acts::RectangleBounds>(5000., 5000.);
+        for (int i = 0; i < n; ++i) {
+            double const z = z_lo + (i + 0.5) * step;
+            std::vector<RegionMaterial::Region> regions;
+            for (auto const& c : coils) {
+                double const dz = z - c.centre[2];
+                if (std::abs(dz) >= c.radius || !(c.density > 0)) {
+                    continue;
+                }
+                double const w = std::sqrt(c.radius * c.radius - dz * dz);
+                auto const material =
+                    Acts::Material::fromMassDensity(static_cast<float>(c.x0 / c.density * cm),
+                                                    static_cast<float>(c.l0 / c.density * cm), c.a,
+                                                    c.z, static_cast<float>(c.density * g / cm3));
+                regions.push_back(
+                    {.x0 = c.centre[0] - w,
+                     .x1 = c.centre[0] + w,
+                     .y0 = c.centre[1] - c.half_height,
+                     .y1 = c.centre[1] + c.half_height,
+                     .slab = Acts::MaterialSlab(
+                         material, static_cast<float>(step * Acts::UnitConstants::mm))});
+            }
+            if (regions.empty()) {
+                continue;
+            }
+            Acts::Transform3 trf = Acts::Transform3::Identity();
+            trf.translate(Acts::Vector3(0, 0, z));
+            auto surface = Acts::Surface::makeShared<Acts::PlaneSurface>(trf, bounds);
+            auto material = std::make_shared<const RegionMaterial>(std::move(regions));
+            surface->assignSurfaceMaterial(material);
+            coil_planes_.push_back({.surface = std::move(surface),
+                                    .material = std::move(material),
+                                    .z = z,
+                                    .z_centre = z_centre});
+        }
+    }
+
+    struct CoilPlane {
+        std::shared_ptr<Acts::PlaneSurface> surface;
+        std::shared_ptr<const RegionMaterial> material;
+        double z = 0;         ///< mm
+        double z_centre = 0;  ///< mm: in front of it, the candidate's upstream tracklet
+    };
+
     Geometry const& geometry_;
     Config config_;
     Acts::GeometryContext gctx_;
     std::map<std::int32_t, std::shared_ptr<Acts::PlaneSurface>> surfaces_;  // per tube
     std::vector<std::shared_ptr<Acts::PlaneSurface>> layer_surfaces_;       // per layer
+    std::vector<CoilPlane> coil_planes_;
     std::unique_ptr<Fitter> fitter_;
 };
 

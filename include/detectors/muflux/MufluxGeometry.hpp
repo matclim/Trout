@@ -257,4 +257,43 @@ class Geometry {
     std::map<std::int32_t, std::pair<int, std::size_t>> index_;
 };
 
+/// A magnet coil as material for the fit: a homogeneous cylinder with a
+/// vertical (y) axis.
+struct Coil {
+    std::array<double, 3> centre{};  ///< mm, global
+    double radius = 0;               ///< mm
+    double half_height = 0;          ///< mm, along y
+    double density = 0;              ///< g/cm3
+    double x0 = 0;                   ///< radiation length [g/cm2]
+    double l0 = 0;                   ///< nuclear interaction length [g/cm2]
+    float a = 0;                     ///< mass number
+    float z = 0;                     ///< atomic number
+};
+
+/// The Goliath coils of the legacy 2018 geometry (muflux2018.gdml): discs of
+/// radius 164.58 cm in volGoliath, which sits at (0.14, 24.07, 351.19) cm;
+/// volmagnetUp, 45 cm high at y = +66.78 cm in volGoliath, "CoilCopper"
+/// (2.99 g/cm3), and volmagnetDown, 30 cm high at y = -74.28 cm, "CoilAluminium"
+/// (0.90 g/cm3). Radiation and interaction lengths of copper and aluminium (PDG).
+inline std::vector<Coil> goliath_2018_coils(double density_up = 2.99, double density_down = 0.90) {
+    return {
+        {.centre = {1.4, 240.7 + 667.7875, 3511.9},
+         .radius = 1645.8,
+         .half_height = 225.,
+         .density = density_up,
+         .x0 = 12.86,
+         .l0 = 137.3,
+         .a = 63.546f,
+         .z = 29.f},
+        {.centre = {1.4, 240.7 - 742.7875, 3511.9},
+         .radius = 1645.8,
+         .half_height = 150.,
+         .density = density_down,
+         .x0 = 24.01,
+         .l0 = 107.2,
+         .a = 26.98f,
+         .z = 13.f},
+    };
+}
+
 }  // namespace SHiP::trout::muflux

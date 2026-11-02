@@ -26,6 +26,11 @@
 //   material        multiple scattering and energy loss in the tube walls (true)
 //   tube_wall       aluminium wall of the drift tubes [mm] (0.85)
 //   tube_wall_density  of the walls [g/cm3] (2.699; 0.9 in the legacy geometry)
+//   coils           the Goliath coils in the fit's material (true; with material)
+//   coil_density_up, coil_density_down  [g/cm3] (2.99 copper, 0.90 aluminium: the
+//                   legacy geometry's "CoilCopper" and "CoilAluminium")
+//   coil_step       spacing of the planes sampling the coils [mm] (50)
+//   coil_margin     a plane joins a candidate's path this close to a coil [mm] (100)
 
 #include "acts_field_provider.hpp"
 #include "detectors/muflux/MufluxEvent.hpp"
@@ -43,6 +48,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <spdlog/fmt/fmt.h>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <string>
@@ -51,6 +57,18 @@
 namespace {
 
 namespace mf = SHiP::trout::muflux;
+
+// The coils' densities and the plane spacing, for the startup log.
+std::string coil_summary(mf::KalmanFit::Config const& k) {
+    if (!(k.material && k.coils)) {
+        return "";
+    }
+    std::string s = ":";
+    for (auto const& c : k.coil_list) {
+        s += fmt::format(" {} g/cm3 at y {:.0f} mm,", c.density, c.centre[1]);
+    }
+    return s + fmt::format(" planes every {} mm", k.coil_step);
+}
 
 class Tracker {
    public:
@@ -62,9 +80,10 @@ class Tracker {
                      wire_table);
         spdlog::info(
             "muflux_tracking: pattern recognition: min hits {}/{}/{}, window {} mm, lr_seeds {}; "
-            "fit: sigma {} mm, material {} (tube wall {} mm, {} g/cm3)",
+            "fit: sigma {} mm, material {} (tube wall {} mm, {} g/cm3; coils {}{})",
             patrec.min_x_up, patrec.min_stereo, patrec.min_x_down, patrec.window, patrec.lr_seeds,
-            kalman.sigma, kalman.material, kalman.tube_wall, kalman.tube_wall_density);
+            kalman.sigma, kalman.material, kalman.tube_wall, kalman.tube_wall_density,
+            kalman.material && kalman.coils, coil_summary(kalman));
     }
 
     ~Tracker() {
@@ -248,6 +267,12 @@ PHLEX_REGISTER_ALGORITHMS(m, config) {
     kalman.tube_wall = config.get<double>("tube_wall", double{kalman.tube_wall});
     kalman.tube_wall_density =
         config.get<double>("tube_wall_density", double{kalman.tube_wall_density});
+    // the Goliath coils (densities of the legacy geometry by default)
+    kalman.coils = config.get<bool>("coils", bool{kalman.coils});
+    kalman.coil_list = mf::goliath_2018_coils(config.get<double>("coil_density_up", 2.99),
+                                              config.get<double>("coil_density_down", 0.90));
+    kalman.coil_step = config.get<double>("coil_step", double{kalman.coil_step});
+    kalman.coil_margin = config.get<double>("coil_margin", double{kalman.coil_margin});
 
     auto tracker = std::make_shared<Tracker>(config.get<std::string>("wire_table"), patrec, kalman);
 
